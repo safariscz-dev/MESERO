@@ -10,12 +10,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.restaurante.mesero.data.local.entity.ConfiguracionEntity
 import com.restaurante.mesero.ui.navigation.MeseroNavGraph
 import com.restaurante.mesero.ui.theme.MeseroAppTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 

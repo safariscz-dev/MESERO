@@ -12,12 +12,14 @@ import com.restaurante.mesero.data.repository.ConfiguracionRepository
 import com.restaurante.mesero.data.repository.MenuRepository
 import com.restaurante.mesero.data.repository.MesaRepository
 import com.restaurante.mesero.data.repository.PedidoRepository
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
-import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
 data class OrderUiState(
@@ -29,16 +31,17 @@ data class OrderUiState(
     val categoriaSeleccionadaId: Long? = null,
     val textoBusqueda: String = "",
     val cargando: Boolean = true,
+    val error: String? = null,
     val moneda: String = "Bs"
 ) {
     val subtotal: Double get() = items.sumOf { it.subtotal }
 }
 
-/** Observaciones rápidas predefinidas, reutilizables en toda la app */
 val OBSERVACIONES_RAPIDAS = listOf(
     "Sin cebolla", "Sin picante", "Poco aceite", "Extra queso", "Bien cocido", "Término medio"
 )
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class OrderViewModel(
     private val mesaRepository: MesaRepository,
     private val menuRepository: MenuRepository,
@@ -46,107 +49,108 @@ class OrderViewModel(
     private val configuracionRepository: ConfiguracionRepository
 ) : ViewModel() {
 
-    private var mesaId: Long = -1L
-    private var nombreMeseroActual: String = ""
-
-    private val _categoriaSeleccionada = MutableStateFlow<Long?>(null)
-    private val _textoBusqueda = MutableStateFlow("")
-    private val _pedidoId = MutableStateFlow<Long?>(null)
-    private val _cargando = MutableStateFlow(true)
+    private var mesaIdActual: Long = -1L
 
     private val _uiState = MutableStateFlow(OrderUiState())
-    val uiState: StateFlow<OrderUiState> get() = _uiState
+    val uiState: StateFlow<OrderUiState> = _uiState.asStateFlow()
+
+    private val _pedidoId = MutableStateFlow<Long?>(null)
+    private val _categoriaSeleccionada = MutableStateFlow<Long?>(null)
+    private val _textoBusqueda = MutableStateFlow("")
+
+    init {
+        viewModelScope.launch {
+            combine(
+                _pedidoId,
+                _categoriaSeleccionada,
+                _textoBusqueda
+            ) { pedidoId, catId, texto -> Triple(pedidoId, catId, texto) }
+                .flatMapLatest { (pedidoId, catId, texto) ->
+                    val itemsFlow = if (pedidoId == null)
+                        flowOf(emptyList<ItemPedidoEntity>())
+                    else
+                        pedidoRepository.observarItems(pedidoId)
+
+                    val pedidoFlow = if (pedidoId == null)
+                        flowOf<PedidoEntity?>(null)
+                    else
+                        pedidoRepository.observarPedido(pedidoId)
+
+                    val productosFlow = when {
+                        texto.isNotBlank() -> menuRepository.buscarProductos(texto)
+                        catId != null -> menuRepository.observarProductosPorCategoria(catId)
+                        else -> menuRepository.observarProductos()
+                    }
+
+                    combine(
+                        itemsFlow,
+                        pedidoFlow,
+                        productosFlow,
+                        menuRepository.observarCategorias(),
+                        configuracionRepository.observar()
+                    ) { items, pedido, productos, categorias, config ->
+                        _uiState.value.copy(
+                            pedido = pedido,
+                            items = items,
+                            productosFiltrados = productos,
+                            categorias = categorias,
+                            categoriaSeleccionadaId = catId,
+                            textoBusqueda = texto,
+                            moneda = config.moneda
+                        )
+                    }
+                }
+                .catch { e ->
+                    _uiState.value = _uiState.value.copy(
+                        error = e.message,
+                        cargando = false
+                    )
+                }
+                .collect { nuevoEstado ->
+                    _uiState.value = nuevoEstado
+                }
+        }
+    }
 
     fun inicializar(mesaId: Long, nombreMesero: String) {
-        if (this.mesaId == mesaId) return // ya inicializado
-        this.mesaId = mesaId
-        this.nombreMeseroActual = nombreMesero
+        if (mesaIdActual == mesaId) return
+        mesaIdActual = mesaId
 
         viewModelScope.launch {
-            val mesa = mesaRepository.obtenerMesa(mesaId) ?: return@launch
-            val pedido = pedidoRepository.obtenerOCrearPedidoAbierto(mesa, nombreMesero)
-            if (mesa.estado == EstadoMesa.LIBRE || mesa.estado == EstadoMesa.ESPERANDO_PEDIDO) {
-                mesaRepository.abrirMesa(mesa, nombreMesero)
-            }
-            _pedidoId.value = pedido.id
-            _cargando.value = false
-        }
+            try {
+                _uiState.value = _uiState.value.copy(cargando = true, error = null)
 
-        val productosFlow = combine(_categoriaSeleccionada, _textoBusqueda) { catId, texto -> catId to texto }
-            .flatMapLatest { (catId, texto) ->
-                when {
-                    texto.isNotBlank() -> menuRepository.buscarProductos(texto)
-                    catId != null -> menuRepository.observarProductosPorCategoria(catId)
-                    else -> menuRepository.observarProductos()
+                val mesa = mesaRepository.obtenerMesa(mesaId)
+                if (mesa == null) {
+                    _uiState.value = _uiState.value.copy(
+                        cargando = false,
+                        error = "Mesa no encontrada"
+                    )
+                    return@launch
                 }
+
+                if (mesa.estado == EstadoMesa.LIBRE || mesa.estado == EstadoMesa.ESPERANDO_PEDIDO) {
+                    mesaRepository.abrirMesa(mesa, nombreMesero)
+                }
+
+                val pedido = pedidoRepository.obtenerOCrearPedidoAbierto(mesa, nombreMesero)
+                _pedidoId.value = pedido.id
+
+                mesaRepository.observarMesa(mesaId)
+                    .catch { /* ignorar errores de observación */ }
+                    .collect { mesaActualizada ->
+                        _uiState.value = _uiState.value.copy(
+                            mesa = mesaActualizada,
+                            cargando = false
+                        )
+                    }
+
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    cargando = false,
+                    error = "Error al abrir mesa: ${e.message}"
+                )
             }
-
-        val itemsFlow = _pedidoId.flatMapLatest { id ->
-            if (id == null) {
-                kotlinx.coroutines.flow.flowOf<List<ItemPedidoEntity>>(emptyList())
-            } else {
-                pedidoRepository.observarItems(id)
-            }
-        }
-
-        val pedidoFlow = _pedidoId.flatMapLatest { id ->
-            if (id == null) {
-                kotlinx.coroutines.flow.flowOf<PedidoEntity?>(null)
-            } else {
-                pedidoRepository.observarPedido(id)
-            }
-        }
-
-        // Combina los datos "base" del pedido (mesa, pedido, items, categorías, productos)
-        data class BaseDatos(
-            val mesa: MesaEntity?,
-            val pedido: PedidoEntity?,
-            val items: List<ItemPedidoEntity>,
-            val categorias: List<CategoriaEntity>,
-            val productos: List<ProductoEntity>
-        )
-
-        val baseFlow = combine(
-            mesaRepository.observarMesa(mesaId),
-            pedidoFlow,
-            itemsFlow,
-            menuRepository.observarCategorias(),
-            productosFlow
-        ) { mesa, pedido, items, categorias, productos ->
-            BaseDatos(mesa, pedido, items, categorias, productos)
-        }
-
-        // Combina los datos de "filtros/estado de UI"
-        data class FiltrosUi(
-            val categoriaId: Long?,
-            val texto: String,
-            val cargando: Boolean,
-            val moneda: String
-        )
-
-        val filtrosFlow = combine(
-            _categoriaSeleccionada,
-            _textoBusqueda,
-            _cargando,
-            configuracionRepository.observar()
-        ) { catId, texto, loading, config ->
-            FiltrosUi(catId, texto, loading, config.moneda)
-        }
-
-        viewModelScope.launch {
-            combine(baseFlow, filtrosFlow) { base, filtros ->
-            OrderUiState(
-                mesa = base.mesa,
-                pedido = base.pedido,
-                items = base.items,
-                categorias = base.categorias,
-                productosFiltrados = base.productos,
-                categoriaSeleccionadaId = filtros.categoriaId,
-                textoBusqueda = filtros.texto,
-                cargando = filtros.cargando,
-                moneda = filtros.moneda
-            )
-        }.collect { _uiState.value = it }
         }
     }
 
@@ -161,44 +165,48 @@ class OrderViewModel(
     }
 
     fun agregarProducto(producto: ProductoEntity, cantidad: Int = 1, observaciones: String? = null) {
-        val pedido = uiState.value.pedido ?: return
+        val pedido = _uiState.value.pedido ?: return
         viewModelScope.launch {
-            pedidoRepository.agregarProducto(pedido, producto, cantidad, observaciones)
-            val mesa = uiState.value.mesa
-            if (mesa != null && mesa.estado == EstadoMesa.ESPERANDO_PEDIDO) {
-                mesaRepository.actualizarEstado(mesa, EstadoMesa.OCUPADA)
+            try {
+                pedidoRepository.agregarProducto(pedido, producto, cantidad, observaciones)
+                val mesa = _uiState.value.mesa
+                if (mesa != null && mesa.estado == EstadoMesa.ESPERANDO_PEDIDO) {
+                    mesaRepository.actualizarEstado(mesa, EstadoMesa.OCUPADA)
+                }
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(error = "Error al agregar producto")
             }
         }
     }
 
     fun cambiarCantidad(item: ItemPedidoEntity, nuevaCantidad: Int) {
         viewModelScope.launch {
-            pedidoRepository.cambiarCantidad(item, nuevaCantidad)
+            try { pedidoRepository.cambiarCantidad(item, nuevaCantidad) } catch (_: Exception) {}
         }
     }
 
     fun actualizarObservaciones(item: ItemPedidoEntity, observaciones: String) {
         viewModelScope.launch {
-            pedidoRepository.actualizarObservaciones(item, observaciones)
+            try { pedidoRepository.actualizarObservaciones(item, observaciones) } catch (_: Exception) {}
         }
     }
 
     fun eliminarItem(item: ItemPedidoEntity) {
         viewModelScope.launch {
-            pedidoRepository.eliminarItem(item)
+            try { pedidoRepository.eliminarItem(item) } catch (_: Exception) {}
         }
     }
 
     fun duplicarItem(item: ItemPedidoEntity) {
         viewModelScope.launch {
-            pedidoRepository.duplicarItem(item)
+            try { pedidoRepository.duplicarItem(item) } catch (_: Exception) {}
         }
     }
 
     fun marcarEsperandoCuenta() {
-        val mesa = uiState.value.mesa ?: return
+        val mesa = _uiState.value.mesa ?: return
         viewModelScope.launch {
-            mesaRepository.actualizarEstado(mesa, EstadoMesa.ESPERANDO_CUENTA)
+            try { mesaRepository.actualizarEstado(mesa, EstadoMesa.ESPERANDO_CUENTA) } catch (_: Exception) {}
         }
     }
 }
